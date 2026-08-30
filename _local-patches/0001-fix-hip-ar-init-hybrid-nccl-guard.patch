@@ -1,0 +1,36 @@
+From: local fix
+Subject: [PATCH] ggml-cuda: guard try_allreduce_nccl in init_hybrid for non-NCCL builds
+
+Block 12 (rdna-boosts 12-hybrid-allreduce-hip.patch) references
+ggml_backend_cuda_comm_try_allreduce_nccl in init_hybrid without an
+#ifdef GGML_USE_NCCL guard, breaking HIP builds without RCCL.
+
+diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
+index 2e55b7e77..9f84c7a99 100644
+--- a/ggml/src/ggml-cuda/ggml-cuda.cu
++++ b/ggml/src/ggml-cuda/ggml-cuda.cu
+@@ -1233,6 +1233,7 @@ static bool ggml_backend_cuda_comm_init_nccl(ggml_backend_cuda_comm_context * re
+ static void ggml_backend_cuda_comm_init_hybrid(ggml_backend_cuda_comm_context * ret) {
+     const bool has_nccl     = ggml_backend_cuda_comm_init_nccl(ret);
+     const bool has_internal = ggml_backend_cuda_comm_init_internal(ret);
++#ifdef GGML_USE_NCCL
+     if (has_nccl) {
+         // Large tensors -> NCCL (P2P).  Small tensors are routed to the
+         // internal pipeline by the dispatcher regardless of this pointer.
+@@ -1242,6 +1243,16 @@ static void ggml_backend_cuda_comm_init_hybrid(ggml_backend_cuda_comm_context *
+         // as-is until comm_init_none is called by the caller).
+         ret->try_allreduce = nullptr;
+     }
++#else
++    // No NCCL/RCCL compiled in (has_nccl is always false); only the internal
++    // pipeline can serve AR.
++    (void) has_nccl;
++    if (!has_internal) {
++        // Neither path came up; butterfly fallback below (try_allreduce stays
++        // as-is until comm_init_none is called by the caller).
++        ret->try_allreduce = nullptr;
++    }
++#endif
+ }
+ 
+ // Top-level init.  Picks a comm setup based on GGML_CUDA_ALLREDUCE (or the
