@@ -1,0 +1,17 @@
+diff --git a/src/llama-model.cpp b/src/llama-model.cpp
+index e679b24e8..1d45a9ef5 100644
+--- a/src/llama-model.cpp
++++ b/src/llama-model.cpp
+@@ -575,7 +575,10 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
+ 
+         // output
+         if (std::regex_match(tensor_name, pattern_output_weight)) {
+-            if (is_dsv4) {
++            // d2t draft-vocab trim: the draft head output must be MIRRORED so it can be
++            //   scattered into the full-vocab space via set_rows (which requires its value
++            //   source to be MIRRORED). Same treatment as the dsv4/dflash heads.
++            if (is_dsv4 || ud->model->d2t != nullptr) {
+                 return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_MIRRORED);
+             }
+             return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_1);
+         }
