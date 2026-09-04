@@ -5,8 +5,10 @@
 # Manage the `rdna-boosts` branch of the local llama.cpp clone:
 #
 #   ./rebuild-rdna-boosts.sh               rebuild branch on latest master (default)
-#   ./rebuild-rdna-boosts.sh push          push branch (force-with-lease) + backup tags
-#   ./rebuild-rdna-boosts.sh tags          list backup tags
+#   ./rebuild-rdna-boosts.sh push          push branch (force-with-lease) — tags NOT pushed
+#   ./rebuild-rdna-boosts.sh push-tags     push all local backup tags to origin (explicit)
+#   ./rebuild-rdna-boosts.sh tags          list backup tags (with tag message)
+#   ./rebuild-rdna-boosts.sh untag [-r] T  delete backup tag(s) locally, or -r from origin
 #   ./rebuild-rdna-boosts.sh restore TAG   roll the branch back to a backup tag
 #
 # Layout (all paths are derived from this script's location, so the whole
@@ -14,7 +16,7 @@
 #
 #   <root>/llama.cpp                                  — llama.cpp clone (branch `rdna-boosts`)
 #   <root>/llama-cpp-rdna-boosts/                     — patch source (fork of stew675/llama-cpp-rdna-boosts)
-#   <root>/llama-cpp-rdna-boosts/patches/             — the 12 delivery patches
+#   <root>/llama-cpp-rdna-boosts/patches/             — the delivery patches (0001..NNNN)
 #   <root>/llama-cpp-rdna-boosts/_local-patches/      — this script + local fix patches
 #
 set -euo pipefail
@@ -30,8 +32,10 @@ LLAMA="$(dirname "$BOOSTS")/llama.cpp"                       # .../llama.cpp
 
 cmd="${1:-rebuild}"
 
-git config --global --add safe.directory "$LLAMA"
-git config --global --add safe.directory "$BOOSTS"
+# best-effort: .gitconfig may be read-only (bind mount) in some environments;
+# git will still fail loudly later with "dubious ownership" if it's actually needed
+git config --global --add safe.directory "$LLAMA" 2>/dev/null || true
+git config --global --add safe.directory "$BOOSTS" 2>/dev/null || true
 
 case "$cmd" in
 
@@ -51,24 +55,38 @@ rebuild)
     echo "==> patch source: $(basename "$BOOSTS") @ $BOOSTS_SHA"
     git -C "$BOOSTS" log --oneline -1
 
+    # collect the delivery patch set (glob is lex-sorted = numeric for 4-digit prefixes)
+    PATCH_FILES=( "$BOOSTS"/patches/*.patch )
+    N_PATCH=${#PATCH_FILES[@]}
+    LAST_PATCH=$(basename "${PATCH_FILES[-1]}" | cut -c1-4)
+
     # 2) pull the latest llama.cpp master
     git -C "$LLAMA" fetch origin
 
-    # 3) safety tag of the current branch tip
-    git -C "$LLAMA" tag "backup/rdna-boosts-$(date +%Y%m%d-%H%M%S)" rdna-boosts
+    # 3) annotated safety tag of the current branch tip, with full build context
+    PREV_TIP=$(git -C "$LLAMA" rev-parse rdna-boosts)
+    MASTER_SHA=$(git -C "$LLAMA" rev-parse origin/master)
+    TAG="backup/rdna-boosts-$(date +%Y%m%d-%H%M%S)"
+    git -C "$LLAMA" tag -a "$TAG" rdna-boosts -m "backup of rdna-boosts before rebuild
+
+rdna-boosts tip : $PREV_TIP
+llama.cpp master: $MASTER_SHA (origin/master)
+boosts source   : $BOOSTS_SHA (llama-cpp-rdna-boosts)
+patches         : $N_PATCH files, 0001..${LAST_PATCH}"
+    echo "==> tagged $TAG"
 
     # 4) rebuild the branch on top of the latest master
     git -C "$LLAMA" checkout rdna-boosts
     git -C "$LLAMA" reset --hard origin/master
 
-    # 5) apply all patches in order (0001..0011 then 12-... — lex sort is correct)
+    # 5) apply all delivery patches in order (lex sort = numeric order)
     cd "$LLAMA"
-    for p in $(ls "$BOOSTS"/patches/*.patch | sort); do
+    for p in "${PATCH_FILES[@]}"; do
         echo "==> $(basename "$p")"
         git apply --3way "$p" || { echo "PATCH FAILED: $p"; exit 1; }
     done
 
-    # NOTE: 27825.patch is intentionally NOT applied — it is superseded by
+    # NOTE: 27825.patch is gone from patches/ — it was superseded by
     # 12-hybrid-allreduce-hip.patch (dedicated allreduce-hip.cu for ROCm).
 
     # 5b) local fix patches (survive rebuilds; skipped if already fixed upstream)
@@ -83,7 +101,7 @@ rebuild)
 
     # 6) one new commit with everything
     git -C "$LLAMA" add -A
-    git -C "$LLAMA" commit -m "rdna-boosts: rebuild on $(git rev-parse --short origin/master) + patches 0001-0012 (boosts@$BOOSTS_SHA)"
+    git -C "$LLAMA" commit -m "rdna-boosts: rebuild on $(git rev-parse --short origin/master) + patches 0001-${LAST_PATCH} x${N_PATCH} (boosts@$BOOSTS_SHA)"
 
     git -C "$LLAMA" log --oneline -2
     git -C "$LLAMA" status --short   # must print nothing
@@ -93,18 +111,47 @@ rebuild)
 
 push)
     # the rebuild rewrites history -> force-with-lease (safe force)
+    # NOTE: tags are intentionally NOT pushed here — use 'push-tags' explicitly,
+    # otherwise deleted remote tags would silently come back.
     git -C "$LLAMA" push --force-with-lease origin rdna-boosts
+    ;;
 
-    # backup tags are local-only by default; push them too
+push-tags)
     tags=$(git -C "$LLAMA" tag -l 'backup/rdna-boosts-*')
-    if [ -n "$tags" ]; then
+    if [ -z "$tags" ]; then
+        echo "no local backup tags to push"
+    else
+        echo "==> pushing $(echo "$tags" | wc -l) backup tag(s) to origin"
         # shellcheck disable=SC2086
         git -C "$LLAMA" push origin $tags
     fi
     ;;
 
 tags)
-    git -C "$LLAMA" tag -l 'backup/rdna-boosts-*' --sort=-creatordate
+    git -C "$LLAMA" for-each-ref 'refs/tags/backup/rdna-boosts-*' --sort=-creatordate \
+        --format='%(creatordate:short)  %(refname:short)  %(contents:subject)'
+    ;;
+
+untag)
+    shift
+    remote=0
+    if [ "${1:-}" = "-r" ]; then remote=1; shift; fi
+    if [ $# -lt 1 ]; then
+        echo "usage: $0 untag [-r] <tag> [tag...]   (list with: $0 tags)" >&2
+        exit 1
+    fi
+    for t in "$@"; do
+        case "$t" in
+            backup/rdna-boosts-*) ;;
+            *) echo "ERROR: refusing to delete non-backup tag: $t" >&2; exit 1 ;;
+        esac
+        if [ "$remote" = 1 ]; then
+            git -C "$LLAMA" push origin ":refs/tags/$t"
+            echo "deleted from origin: $t"
+        else
+            git -C "$LLAMA" tag -d "$t"
+        fi
+    done
     ;;
 
 restore)
@@ -122,7 +169,7 @@ restore)
     ;;
 
 *)
-    echo "usage: $0 [rebuild | push | tags | restore <tag>]" >&2
+    echo "usage: $0 [rebuild | push | push-tags | tags | untag [-r] <tag>... | restore <tag>]" >&2
     exit 1
     ;;
 esac
