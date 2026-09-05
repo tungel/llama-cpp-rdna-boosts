@@ -5,6 +5,10 @@
 # Manage the `rdna-boosts` branch of the local llama.cpp clone:
 #
 #   ./rebuild-rdna-boosts.sh               rebuild branch on latest master (default)
+#   ./rebuild-rdna-boosts.sh rebuild --base <rev>
+#                                        rebuild on a specific llama.cpp revision
+#                                        instead of origin/master, e.g.
+#                                        rebuild --base 67a17c17c
 #   ./rebuild-rdna-boosts.sh push          push branch (force-with-lease) — tags NOT pushed
 #   ./rebuild-rdna-boosts.sh push-tags     push all local backup tags to origin (explicit)
 #   ./rebuild-rdna-boosts.sh tags          list backup tags (with tag message)
@@ -40,6 +44,17 @@ git config --global --add safe.directory "$BOOSTS" 2>/dev/null || true
 case "$cmd" in
 
 rebuild)
+    # optional: rebuild --base <rev>  (default: origin/master)
+    if [ "${1:-}" = "rebuild" ]; then shift; fi
+    BASE_REF="origin/master"
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --base) BASE_REF="${2:?usage: rebuild --base <revision>}"; shift ;;
+            *) echo "ERROR: unknown option for rebuild: $1" >&2; exit 1 ;;
+        esac
+        shift
+    done
+
     # refuse to run with a dirty llama.cpp tree — reset --hard would discard local changes
     if [ -n "$(git -C "$LLAMA" status --porcelain)" ]; then
         echo "ERROR: $LLAMA working tree is dirty — commit or stash first" >&2
@@ -63,27 +78,47 @@ rebuild)
     # 2) pull the latest llama.cpp master
     git -C "$LLAMA" fetch origin
 
-    # 3) annotated safety tag of the current branch tip, with full build context
+    # 2b) resolve the requested base revision (after fetch, so a short SHA from
+    #     a just-landed commit also resolves)
+    BASE_SHA=$(git -C "$LLAMA" rev-parse --verify "$BASE_REF^{commit}" 2>/dev/null) \
+        || { echo "ERROR: '$BASE_REF' does not resolve to a commit in $LLAMA" >&2; exit 1; }
+    BASE_SHORT=$(git -C "$LLAMA" rev-parse --short "$BASE_SHA")
+    echo "==> base revision: $BASE_SHORT ($BASE_REF)"
+
+    # 3) annotated safety tag of the current branch tip, with full build context.
+    #    The subject line carries the short SHAs so 'git tag -l' / '$0 tags'
+    #    one-liners stay informative (lightweight tags used to show the commit
+    #    subject here; annotated tags show THIS message instead).
     PREV_TIP=$(git -C "$LLAMA" rev-parse rdna-boosts)
-    MASTER_SHA=$(git -C "$LLAMA" rev-parse origin/master)
+    PREV_SHORT=$(git -C "$LLAMA" rev-parse --short "$PREV_TIP")
     TAG="backup/rdna-boosts-$(date +%Y%m%d-%H%M%S)"
-    git -C "$LLAMA" tag -a "$TAG" rdna-boosts -m "backup of rdna-boosts before rebuild
+    git -C "$LLAMA" tag -a "$TAG" rdna-boosts -m "backup of rdna-boosts@${PREV_SHORT} before rebuild on ${BASE_SHORT} (${BASE_REF}), ${N_PATCH} patches 0001-${LAST_PATCH} (boosts@${BOOSTS_SHA})
 
 rdna-boosts tip : $PREV_TIP
-llama.cpp master: $MASTER_SHA (origin/master)
+llama.cpp base  : $BASE_SHA ($BASE_REF)
 boosts source   : $BOOSTS_SHA (llama-cpp-rdna-boosts)
 patches         : $N_PATCH files, 0001..${LAST_PATCH}"
     echo "==> tagged $TAG"
 
-    # 4) rebuild the branch on top of the latest master
+    # 4) rebuild the branch on top of the base revision
     git -C "$LLAMA" checkout rdna-boosts
-    git -C "$LLAMA" reset --hard origin/master
+    git -C "$LLAMA" reset --hard "$BASE_SHA"
 
     # 5) apply all delivery patches in order (lex sort = numeric order)
+    #    exact-context apply first: if the patch matches the file verbatim the
+    #    result is deterministic and a 3-way merge is unnecessary. (A --3way
+    #    merge can also refuse cases where plain apply would succeed, e.g.
+    #    two unrelated insertions at the same position.) Fall back to --3way
+    #    only when the context has actually drifted.
     cd "$LLAMA"
     for p in "${PATCH_FILES[@]}"; do
         echo "==> $(basename "$p")"
-        git apply --3way "$p" || { echo "PATCH FAILED: $p"; exit 1; }
+        if git apply --check "$p" 2>/dev/null; then
+            git apply "$p"
+        else
+            echo "    (context drifted, trying 3-way merge)"
+            git apply --3way "$p" || { echo "PATCH FAILED: $p"; exit 1; }
+        fi
     done
 
     # NOTE: 27825.patch is gone from patches/ — it was superseded by
@@ -95,13 +130,18 @@ patches         : $N_PATCH files, 0001..${LAST_PATCH}"
             echo "skipping (already applied): $(basename "$p")"
         else
             echo "==> $(basename "$p")"
-            git apply --3way "$p" || { echo "PATCH FAILED: $p"; exit 1; }
+            if git apply --check "$p" 2>/dev/null; then
+                git apply "$p"
+            else
+                echo "    (context drifted, trying 3-way merge)"
+                git apply --3way "$p" || { echo "PATCH FAILED: $p"; exit 1; }
+            fi
         fi
     done
 
     # 6) one new commit with everything
     git -C "$LLAMA" add -A
-    git -C "$LLAMA" commit -m "rdna-boosts: rebuild on $(git rev-parse --short origin/master) + patches 0001-${LAST_PATCH} x${N_PATCH} (boosts@$BOOSTS_SHA)"
+    git -C "$LLAMA" commit -m "rdna-boosts: rebuild on $BASE_SHORT ($BASE_REF) + patches 0001-${LAST_PATCH} x${N_PATCH} (boosts@$BOOSTS_SHA)"
 
     git -C "$LLAMA" log --oneline -2
     git -C "$LLAMA" status --short   # must print nothing
@@ -169,7 +209,7 @@ restore)
     ;;
 
 *)
-    echo "usage: $0 [rebuild | push | push-tags | tags | untag [-r] <tag>... | restore <tag>]" >&2
+    echo "usage: $0 [rebuild [--base <rev>] | push | push-tags | tags | untag [-r] <tag>... | restore <tag>]" >&2
     exit 1
     ;;
 esac
