@@ -104,46 +104,70 @@ patches         : $N_PATCH files, 0001..${LAST_PATCH}"
     git -C "$LLAMA" checkout rdna-boosts
     git -C "$LLAMA" reset --hard "$BASE_SHA"
 
-    # 5) apply all delivery patches in order (lex sort = numeric order)
-    #    exact-context apply first: if the patch matches the file verbatim the
-    #    result is deterministic and a 3-way merge is unnecessary. (A --3way
-    #    merge can also refuse cases where plain apply would succeed, e.g.
-    #    two unrelated insertions at the same position.) Fall back to --3way
-    #    only when the context has actually drifted.
+    # 5) apply all delivery patches via 'git am' (one commit per block).
+    #    Why git am (not the old plain 'git apply' + --3way loop): 'git am'
+    #    commits after each block, so the index is always in sync with the
+    #    worktree. That is exactly what 'git apply --3way' demands (check_index
+    #    -> check_preimage -> verify_index_match); the old loop dirtied the
+    #    worktree with earlier blocks while the index stayed at the base, so
+    #    every later-block file an earlier block had touched was rejected with
+    #    "does not match index". git am makes that failure impossible.
+    #    Strict first: on the recorded baseline the tree == the canonical fork
+    #    tip, so this is exact. On a drifted base the strict pass fails, we
+    #    abort, and retry the whole series with 'git am -3' (3-way merge
+    #    against the blob ids recorded in the format-patch output).
     cd "$LLAMA"
-    for p in "${PATCH_FILES[@]}"; do
-        echo "==> $(basename "$p")"
-        if git apply --check "$p" 2>/dev/null; then
-            git apply "$p"
-        else
-            echo "    (context drifted, trying 3-way merge)"
-            git apply --3way "$p" || { echo "PATCH FAILED: $p"; exit 1; }
+    echo "==> git am: applying ${N_PATCH} delivery patches (0001-${LAST_PATCH})"
+    if ! git am "${PATCH_FILES[@]}"; then
+        echo "    strict 'git am' failed at this base; aborting + retrying with 'git am -3'"
+        git am --abort >/dev/null 2>&1 || true
+        if ! git am -3 "${PATCH_FILES[@]}"; then
+            echo "PATCH FAILED (git am -3); last applied: $(git -C "$LLAMA" log --oneline -1)"
+            echo "  A block needs manual resolution; the series is PAUSED. To continue:"
+            echo "    inspect : git status && git diff"
+            echo "    fix + go: git add <file> && git am --continue"
+            echo "    skip it : git am --skip"
+            echo "    abort   : git am --abort      (leaves rdna-boosts at $BASE_SHORT)"
+            exit 1
         fi
-    done
+    fi
 
-    # NOTE: 27825.patch is gone from patches/ — it was superseded by
+    # NOTE: 27825.patch is gone from patches/ - it was superseded by
     # 12-hybrid-allreduce-hip.patch (dedicated allreduce-hip.cu for ROCm).
 
-    # 5b) local fix patches (survive rebuilds; skipped if already fixed upstream)
+    # 5b) local fix patches (survive rebuilds; one commit each; skipped when the
+    #     fix is already folded into the delivery set). The tree is clean after
+    #     'git am', so the --3way fallback here never hits the dirty-index check
+    #     that plagued the old delivery loop. Each local patch is committed so
+    #     the tree stays clean for the next one. Works on plain 'git diff'
+    #     patches (the usual local-fix form) as well as format-patch.
+    local_n=0
     for p in $(ls "$LOCAL_PATCHES"/*.patch 2>/dev/null | sort); do
         if git apply --check --reverse "$p" 2>/dev/null; then
             echo "skipping (already applied): $(basename "$p")"
-        else
-            echo "==> $(basename "$p")"
-            if git apply --check "$p" 2>/dev/null; then
-                git apply "$p"
-            else
-                echo "    (context drifted, trying 3-way merge)"
-                git apply --3way "$p" || { echo "PATCH FAILED: $p"; exit 1; }
+            continue
+        fi
+        echo "==> local patch: $(basename "$p")"
+        if ! git apply "$p" 2>/dev/null; then
+            echo "    (context drifted, trying 3-way merge)"
+            if ! git apply --3way "$p"; then
+                echo "LOCAL PATCH FAILED: $p"
+                echo "  the tree is clean-safe; fix the conflicted file, then:"
+                echo "    git add -A && git commit -m 'local patch: <name>'"
+                echo "  or revert this one patch: git apply -R --3way $p"
+                exit 1
             fi
         fi
+        git add -A
+        git commit -q -m "local patch: $(basename "$p")"
+        local_n=$((local_n + 1))
     done
+    if [ "$local_n" -eq 0 ]; then echo "no local patches to apply"; fi
 
-    # 6) one new commit with everything
-    git -C "$LLAMA" add -A
-    git -C "$LLAMA" commit -m "rdna-boosts: rebuild on $BASE_SHORT ($BASE_REF) + patches 0001-${LAST_PATCH} x${N_PATCH} (boosts@$BOOSTS_SHA)"
-
-    git -C "$LLAMA" log --oneline -2
+    # 6) result: base + N delivery commits (+ any local commits), no squash.
+    echo
+    echo "==> rebuilt rdna-boosts: $BASE_SHORT + ${N_PATCH} delivery + ${local_n} local commit(s)"
+    git -C "$LLAMA" log --oneline -$((N_PATCH + local_n + 1))
     git -C "$LLAMA" status --short   # must print nothing
     echo
     echo "Done. When ready:  $0 push"
