@@ -104,6 +104,20 @@ patches         : $N_PATCH files, 0001..${LAST_PATCH}"
     git -C "$LLAMA" checkout rdna-boosts
     git -C "$LLAMA" reset --hard "$BASE_SHA"
 
+    # 4b) clear any stale am/rebase session dir. A previously paused/aborted
+    #     'git am' leaves .git/rebase-apply behind; a later 'git reset' moves
+    #     HEAD but does NOT remove it, and the next 'git am' then dies before
+    #     applying anything with "previous rebase directory .git/rebase-apply
+    #     still exists but mbox given". The dirty check above passed and we
+    #     just reset to the base, so any session dir here is stale by
+    #     definition; its commits stay reachable via reflog.
+    for d in rebase-apply rebase-merge; do
+        if [ -d "$LLAMA/.git/$d" ]; then
+            echo "==> removing stale git am/rebase session (.git/$d) left by an interrupted run"
+            rm -rf "$LLAMA/.git/$d"
+        fi
+    done
+
     # 5) apply all delivery patches via 'git am' (one commit per block).
     #    Why git am (not the old plain 'git apply' + --3way loop): 'git am'
     #    commits after each block, so the index is always in sync with the
