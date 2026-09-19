@@ -178,6 +178,27 @@ patches         : $N_PATCH files, 0001..${LAST_PATCH}"
     done
     if [ "$local_n" -eq 0 ]; then echo "no local patches to apply"; fi
 
+    # 5c) scrub cross-repo issue/PR references from the new commit messages.
+    #     GitHub turns full github.com issue/PR URLs AND the short
+    #     'org/repo#NNN' form in a pushed commit message into "referenced in
+    #     a commit" timeline events on the target issues. This rebuild mints
+    #     fresh SHAs every run, so every push re-fires them (observed noise:
+    #     ROCm/legacy-rocm-build#6520 re-notified on every push of block 12).
+    #     Only the commits on top of the base are rewritten (upstream commits
+    #     keep their original SHAs and are never re-pushed, so they are left
+    #     alone). Bare '#NNN' references are kept: they only resolve inside
+    #     this fork, so they create no cross-repo events, and they keep the
+    #     'upstream #NNN' context readable locally.
+    SCRUB_SED='s@(https?://)?(www\.)?github\.com/[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+/(issues|pull)/[0-9]+(#[A-Za-z0-9-]+)?@@g
+s@[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+#[0-9]+@@g'
+    if ! git filter-branch -f --msg-filter "sed -E '$SCRUB_SED'" "${BASE_SHA}..HEAD"; then
+        echo "ERROR: commit-message scrub failed (see message above)" >&2
+        git update-ref -d refs/original/refs/heads/rdna-boosts 2>/dev/null || true
+        exit 1
+    fi
+    git update-ref -d refs/original/refs/heads/rdna-boosts 2>/dev/null || true
+    echo "==> scrubbed cross-repo issue/PR links from block commit messages"
+
     # 6) result: base + N delivery commits (+ any local commits), no squash.
     echo
     echo "==> rebuilt rdna-boosts: $BASE_SHORT + ${N_PATCH} delivery + ${local_n} local commit(s)"
